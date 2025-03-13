@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/evalphobia/logrus_sentry"
 	"github.com/fsnotify/fsnotify"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -53,6 +55,7 @@ func main() {
 	sentryReleaseFlag := flag.String("sentry-release", "", "specify the application's release version for Sentry error reporting")
 	sentryAlias := flag.String("sentryDsn", "", "alias for sentry-dsn")
 	overlapping := flag.Bool("overlapping", false, "enable tasks overlapping")
+	signals := flag.String("job-signals", "", "list of signals to listen for, separated by commas (omit SIG prefix)")
 	flag.Parse()
 
 	var (
@@ -123,7 +126,7 @@ func main() {
 			forkExec()
 			return
 		}
-		
+
 		logrus.Warn("process reaping disabled, not pid 1")
 	}
 	crontabFileName := flag.Args()[0]
@@ -227,6 +230,18 @@ func main() {
 		}()
 	}
 
+	var siglist []os.Signal
+	if *signals != "" {
+		for _, name := range strings.Split(*signals, ",") {
+			sig := unix.SignalNum(name)
+			if int(sig) == 0 {
+				logrus.Errorf("unknown signal \"%s\"", name)
+				continue
+			}
+			siglist = append(siglist, sig)
+		}
+	}
+
 	for {
 		promMetrics.Reset()
 
@@ -254,7 +269,7 @@ func main() {
 				"job.position": job.Position,
 			})
 
-			cron.StartJob(&wg, tab.Context, job, exitCtx, cronLogger, *overlapping, *passthroughLogs, &promMetrics)
+			cron.StartJob(&wg, tab.Context, job, exitCtx, cronLogger, *overlapping, siglist, *passthroughLogs, &promMetrics)
 		}
 
 		termSig := <-termChan
