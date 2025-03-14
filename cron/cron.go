@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
@@ -63,7 +64,7 @@ func startReaderDrain(wg *sync.WaitGroup, readerLogger *logrus.Entry, reader io.
 	}()
 }
 
-func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, passthroughLogs bool) error {
+func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, passthroughLogs bool, signals []os.Signal) error {
 	jobLogger.Info("starting")
 
 	cmd := exec.Command(cronCtx.Shell, "-c", command)
@@ -101,6 +102,9 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 		return err
 	}
 
+	ctx, stopSignalJob := context.WithCancel(context.Background())
+	go signalJob(ctx, cmd, signals, jobLogger)
+
 	var wg sync.WaitGroup
 
 	if stdout != nil {
@@ -112,14 +116,39 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 		stderrLogger := jobLogger.WithFields(logrus.Fields{"channel": "stderr"})
 		startReaderDrain(&wg, stderrLogger, stderr)
 	}
-
 	wg.Wait()
+	stopSignalJob()
 
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("error running command: %v", err)
+		if exitErr, ok := err.(*exec.ExitError); !ok {
+			return fmt.Errorf("error running command: %v", err)
+		} else {
+			return fmt.Errorf("command exit error: %v", exitErr)
+		}
 	}
 
 	return nil
+}
+
+func signalJob(ctx context.Context, cmd *exec.Cmd, signals []os.Signal, logger *logrus.Entry) {
+	if len(signals) == 0 {
+		return
+	}
+	jobSignal := make(chan os.Signal, 1)
+	signal.Notify(jobSignal, signals...)
+	defer signal.Stop(jobSignal)
+	for {
+		select {
+		case sig := <-jobSignal:
+			sysSig, _ := sig.(syscall.Signal)
+			// Because job run by the shell we passed the signal to the whole group, not only to the process.
+			if err := syscall.Kill(-cmd.Process.Pid, sysSig); err != nil {
+				logger.Errorf("failed to send signal to job: %v", err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func monitorJob(ctx context.Context, job *crontab.Job, t0 time.Time, jobLogger *logrus.Entry, overlapping bool, promMetrics *prometheus_metrics.PrometheusMetrics) {
@@ -221,6 +250,7 @@ func StartJob(
 	exitCtx context.Context,
 	cronLogger *logrus.Entry,
 	overlapping bool,
+	signals []os.Signal,
 	passthroughLogs bool,
 	promMetrics *prometheus_metrics.PrometheusMetrics,
 ) {
@@ -242,7 +272,7 @@ func StartJob(
 
 		defer timer.ObserveDuration()
 
-		err := runJob(cronCtx, job.Command, jobLogger, passthroughLogs)
+		err := runJob(cronCtx, job.Command, jobLogger, passthroughLogs, signals)
 
 		promMetrics.CronsExecCounter.With(jobPromLabels(job)).Inc()
 
